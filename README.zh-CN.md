@@ -1,7 +1,8 @@
 # OpenCLI
 
-> **把网站、浏览器会话、Electron 应用和本地工具，统一变成适合人类与 AI Agent 使用的确定性接口。**  
-> 复用浏览器登录态，先自动化真实操作，再把高频流程沉淀成可复用的 CLI 命令。
+> **把任意网站变成 CLI & 让 AI Agent 操控你的登录态浏览器。**
+> 把网站、浏览器会话、Electron 应用和本地工具，统一变成适合人类与 AI Agent 使用的确定性接口。
+> 或者直接操控你的登录态浏览器做任何事 —— 导航、填表单、点击、抓取、自动化。
 
 [![English](https://img.shields.io/badge/docs-English-1D4ED8?style=flat-square)](./README.md)
 [![npm](https://img.shields.io/npm/v/@jackwener/opencli?style=flat-square)](https://www.npmjs.com/package/@jackwener/opencli)
@@ -14,16 +15,16 @@ OpenCLI 可以用同一套 CLI 做三类事情：
 - **让 AI Agent 操作任意网站**：在你的 AI Agent（Claude Code、Cursor 等）中安装 `opencli-adapter-author` skill，Agent 就能用你的已登录浏览器导航、点击、输入/填充、提取任意网页内容。
 - **把新网站写成 CLI**：用 `opencli browser` 原语 + `opencli-adapter-author` skill，从站点侦察、API 发现、字段解码到 `opencli browser verify` 一条龙。
 
-除了网站能力，OpenCLI 还是一个 **CLI 枢纽**：你可以把 `gh`、`docker` 等本地工具统一注册到 `opencli` 下，也可以通过桌面端适配器控制 Cursor、Codex、Antigravity、ChatGPT、Notion 等 Electron 应用。
+除了网站能力，OpenCLI 还是一个 **CLI 枢纽**：你可以把 `gh`、`docker`、`longbridge`、`tg`、`discord`、`wx`、`ntn`（Notion）等本地工具统一注册到 `opencli` 下，也可以通过桌面端适配器控制 Cursor、Codex、Antigravity、ChatGPT 等 Electron 应用。
 
 ## 亮点
 
-- **桌面应用控制** — 通过 CDP 直接在终端驱动 Electron 应用（Cursor、Codex、ChatGPT、Notion 等）。
+- **桌面应用控制** — 通过 CDP 直接在终端驱动 Electron 应用（Cursor、Codex、ChatGPT 等）。
 - **AI Agent 浏览器自动化** — 安装 `opencli-adapter-author` skill，你的 AI Agent 就能操作任意网站：导航、点击、输入/填充、提取、截图——全部通过你的已登录 Chrome 会话完成。
 - **网站 → CLI** — 把任何网站变成确定性 CLI：100+ 站点能力已注册，或用 `opencli-adapter-author` skill + `opencli browser verify` 自己写。
 - **账号安全** — 复用 Chrome/Chromium 登录态，凭证永远不会离开浏览器。
 - **面向 AI Agent** — 一个 skill 带你走完站点侦察、API 发现、字段解码、适配器编写、验证的全流程。
-- **CLI 枢纽** — 统一发现、自动安装、纯透传任何外部 CLI（gh、docker、obsidian 等）。
+- **CLI 枢纽** — 统一发现、自动安装、纯透传任何外部 CLI（gh、docker、obsidian、tg、discord、wx 等）。
 - **零 LLM 成本** — 运行时不消耗模型 token，跑 10,000 次也不花一分钱。
 - **确定性输出** — 相同命令，相同输出结构，每次一致。可管道、可脚本、CI 友好。
 
@@ -111,7 +112,7 @@ npx skills add jackwener/opencli --skill smart-search
 |-------|---------|-------------------|
 | **opencli-adapter-author** | 实时操作任意网站，或为新站点写可复用适配器 | "帮我看看小红书的通知" / "帮我做一个抖音热门的适配器" / "帮我做一个抓取这个页面热帖的命令" |
 | **opencli-autofix** | 内置命令失败时修复已有适配器 | "`opencli zhihu hot` 返回空了，修一下" |
-| **opencli-browser** | 浏览器自动化参考文档 | "用浏览器命令抓取这个页面" |
+| **opencli-browser** | 浏览器自动化参考文档 | "帮我填一下这个表单" / "用浏览器命令抓取这个页面" |
 | **opencli-usage** | 所有命令和站点的快速参考 | "OpenCLI 有哪些 Twitter 相关的命令？" |
 | **smart-search** | 在现有 OpenCLI 能力里搜索 | "帮我找个 B 站热门相关的适配器" |
 
@@ -136,7 +137,7 @@ Agent 在内部自动处理所有 `opencli browser` 命令——你只需用自�
 
 `browser` 可用命令包括：`open`、`state`、`click`、`type`、`fill`、`select`、`keys`、`wait`、`get`、`find`、`extract`、`frames`、`screenshot`、`scroll`、`back`、`eval`、`network`、`tab list`、`tab new`、`tab select`、`tab close`、`init`、`verify`、`close`。
 
-`opencli browser open <url>` 和 `opencli browser tab new [url]` 都会返回 target ID。`opencli browser tab list` 用来查看当前已存在 tab 的 target ID，再通过 `--tab <targetId>` 把命令明确路由到某个 tab。`tab new` 只会新建 tab，不会改变默认浏览器目标；只有显式执行 `tab select <targetId>`，才会把该 tab 设为后续未指定 target 的 `opencli browser ...` 命令的默认目标。
+`opencli browser` 命令必须紧跟一个 `<session>` 位置参数。`opencli browser work open <url>` 和 `opencli browser work tab new [url]` 都会返回 target ID。`opencli browser work tab list` 用来查看当前已存在 tab 的 target ID，再通过 `--tab <targetId>` 把命令明确路由到某个 tab。`tab new` 只会新建 tab，不会改变默认浏览器目标；只有显式执行 `tab select <targetId>`，才会把该 tab 设为同一 session 后续未指定 target 的默认目标。
 
 ## 核心概念
 
@@ -144,7 +145,7 @@ Agent 在内部自动处理所有 `opencli browser` 命令——你只需用自�
 
 `opencli browser` 命令是 AI Agent 操作网站的底层原语。你不需要手动运行这些命令——把 `opencli-adapter-author` skill 安装到你的 AI Agent 中，用自然语言描述你想做的事，Agent 会自动处理浏览器操作。
 
-比如你告诉 Agent：*"帮我看看小红书的通知"*——Agent 会在底层调用 `opencli browser open`、`state`、`click` 等命令。
+比如你告诉 Agent：*"帮我看看小红书的通知"*——Agent 会在底层调用 `opencli browser <session> open`、`state`、`click` 等命令。
 
 ### 内置适配器：稳定命令
 
@@ -158,14 +159,14 @@ Agent 在内部自动处理所有 `opencli browser` 命令——你只需用自�
 2. 发现目标 endpoint——network 精读、initial state、bundle 搜索、token 溯源，或 interceptor 兜底
 3. 定认证策略——`PUBLIC` / `COOKIE` / `INTERCEPT` / `UI` / `LOCAL`
 4. 字段解码 + 设计输出列
-5. `opencli browser analyze <url>` 一步侦察，再 `opencli browser init <site>/<name>` → 写适配器 → `opencli browser verify <site>/<name>`
+5. `opencli browser recon analyze <url>` 一步侦察，再 `opencli browser recon init <site>/<name>` → 写适配器 → `opencli browser recon verify <site>/<name>`
 6. 把站点知识沉到 `~/.opencli/sites/<site>/`，下次写同站点的其他命令直接吃缓存
 
 ### CLI 枢纽与桌面端适配器
 
 OpenCLI 不只是网站 CLI，还可以：
 
-- 统一代理本地二进制工具，例如 `gh`、`docker`、`obsidian`
+- 统一代理本地二进制工具，例如 `gh`、`docker`、`obsidian`、`tg`、`discord`、`wx`
 - 通过专门适配器和 CDP 集成控制 Electron 桌面应用
 
 ## 前置要求
@@ -181,8 +182,7 @@ OpenCLI 不只是网站 CLI，还可以：
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `OPENCLI_DAEMON_PORT` | `19825` | daemon-extension 通信端口 |
-| `OPENCLI_WINDOW_FOCUSED` | `false` | 设为 `1` 时 automation 窗口在前台打开（适合调试）。`--focus` 标志会设置此变量 |
-| `OPENCLI_LIVE` | `false` | 设为 `1` 时 adapter 命令执行完后保留 automation 窗口不关闭（适合检查页面）。`--live` 标志会设置此变量 |
+| `OPENCLI_WINDOW` | 命令默认值 | 设为 `foreground` 或 `background` 来覆盖 Browser Bridge 窗口位置。浏览器型命令也支持 `--window <foreground\|background>` |
 | `OPENCLI_BROWSER_CONNECT_TIMEOUT` | `30` | 浏览器连接超时（秒） |
 | `OPENCLI_BROWSER_COMMAND_TIMEOUT` | `60` | 单个浏览器命令超时（秒） |
 | `OPENCLI_CDP_ENDPOINT` | — | Chrome DevTools Protocol 端点，用于远程浏览器或 Electron 应用 |
@@ -190,7 +190,7 @@ OpenCLI 不只是网站 CLI，还可以：
 | `OPENCLI_VERBOSE` | `false` | 启用详细日志（`-v` 也可以） |
 | `DEBUG_SNAPSHOT` | — | 设为 `1` 输出 DOM 快照调试信息 |
 
-`--focus` 同时适用于 `opencli browser *` 和浏览器型 adapter 命令。`--live` 主要是给 adapter 命令用的：`browser` 子命令本来就会一直保留 automation window，直到你手动执行 `opencli browser close` 或等空闲超时。
+`opencli browser *` 必须紧跟一个 `<session>` 位置参数，默认使用前台窗口，并保留该 session 的 tab lease，直到你手动执行 `opencli browser <session> close` 或等空闲超时。浏览器型 adapter 默认使用后台 adapter 窗口并在命令结束后释放一次性 tab lease；如果需要调试最终页面，可以传 `--window foreground --keep-tab true`。
 
 ## 更新
 
@@ -237,18 +237,18 @@ npm link
 | **tieba** | `hot` `posts` `search` `read` | 浏览器 |
 | **hupu** | `hot` `search` `detail` `mentions` `reply` `like` `unlike` | 浏览器 |
 | **cursor** | `status` `send` `read` `new` `dump` `composer` `model` `extract-code` `ask` `screenshot` `history` `export` | 桌面端 |
-| **bilibili** | `hot` `search` `me` `favorite` `history` `feed` `subtitle` `video` `comments` `dynamic` `ranking` `following` `user-videos` `download` | 浏览器 |
+| **bilibili** | `hot` `search` `me` `favorite` `history` `feed` `subtitle` `summary` `video` `comments` `dynamic` `ranking` `following` `user-videos` `download` | 浏览器 |
 | **codex** | `status` `send` `read` `new` `dump` `extract-diff` `model` `ask` `screenshot` `projects` `history` `export` | 桌面端 |
 | **chatwise** | `status` `new` `send` `read` `ask` `model` `history` `export` `screenshot` | 桌面端 |
 | **doubao** | `status` `new` `send` `read` `ask` `history` `detail` `meeting-summary` `meeting-transcript` | 浏览器 |
 | **doubao-app** | `status` `new` `send` `read` `ask` `screenshot` `dump` | 桌面端 |
-| **notion** | `status` `search` `read` `new` `write` `sidebar` `favorites` `export` | 桌面端 |
 | **discord-app** | `status` `send` `read` `channels` `servers` `search` `members` | 桌面端 |
 | **v2ex** | `hot` `latest` `topic` `node` `user` `member` `replies` `nodes` `daily` `me` `notifications` | 公开 / 浏览器 |
 | **xueqiu** | `feed` `hot-stock` `hot` `search` `stock` `comments` `watchlist` `earnings-date` `fund-holdings` `fund-snapshot` | 浏览器 |
 | **antigravity** | `status` `send` `read` `new` `dump` `extract-code` `model` `watch` `serve` | 桌面端 |
 | **chatgpt-app** | `status` `new` `send` `read` `ask` `model` | 桌面端 |
 | **xiaohongshu** | `search` `note` `comments` `notifications` `feed` `user` `download` `publish` `creator-notes` `creator-note-detail` `creator-notes-summary` `creator-profile` `creator-stats` | 浏览器 |
+| **rednote** | `search` `note` `comments` `user` `download` `feed` `notifications` | 浏览器 |
 | **xiaoe** | `courses` `detail` `catalog` `play-url` `content` | 浏览器 |
 | **quark** | `ls` `mkdir` `mv` `rename` `rm` `save` `share-tree` | 浏览器 |
 | **uiverse** | `code` `preview` | 浏览器 |
@@ -263,6 +263,7 @@ npm link
 | **zhihu** | `hot` `search` `question` `download` `follow` `like` `favorite` `comment` `answer` | 浏览器 |
 | **weixin** | `download` | 浏览器 |
 | **youtube** | `search` `video` `transcript` `comments` `channel` `playlist` `feed` `history` `watch-later` `subscriptions` `like` `unlike` `subscribe` `unsubscribe` | 浏览器 |
+| **youdao** | `note` | 公开 |
 | **boss** | `search` `detail` `recommend` `joblist` `greet` `batchgreet` `send` `chatlist` `chatmsg` `invite` `mark` `exchange` `resume` `stats` | 浏览器 |
 | **coupang** | `search` `add-to-cart` | 浏览器 |
 | **bbc** | `news` | 公共 API |
@@ -281,7 +282,7 @@ npm link
 | **reuters** | `search` | 浏览器 |
 | **smzdm** | `search` | 浏览器 |
 | **web** | `read` | 浏览器 |
-| **weibo** | `hot` `search` `feed` `user` `me` `post` `comments` | 浏览器 |
+| **weibo** | `hot` `search` `feed` `user` `user-posts` `me` `post` `comments` | 浏览器 |
 | **yahoo-finance** | `quote` | 浏览器 |
 | **sinafinance** | `news` | 🌐 公开 |
 | **barchart** | `quote` `options` `greeks` `flow` | 浏览器 |
@@ -333,14 +334,19 @@ OpenCLI 也可以作为你现有命令行工具的统一入口，负责发现、
 | **gh** | GitHub CLI | `opencli gh pr list --limit 5` |
 | **obsidian** | Obsidian 仓库管理 | `opencli obsidian search query="AI"` |
 | **docker** | Docker 命令行工具 | `opencli docker ps` |
+| **longbridge** | Longbridge CLI — 通过 Longbridge OpenAPI 获取行情、账户和交易能力 | `opencli longbridge quote TSLA.US --format json` |
+| **ntn** | Notion CLI — 基于官方 Notion API 的页面、数据库、块、搜索、评论命令 | `opencli ntn pages list` |
 | **lark-cli** | 飞书 CLI — 消息、文档、日历、任务，200+ 命令 | `opencli lark-cli calendar +agenda` |
 | **dws** | 钉钉 CLI — 钉钉全套产品能力的跨平台命令行工具，支持人类和 AI Agent 使用 | `opencli dws msg send --to user "hello"` |
 | **wecom-cli** | 企业微信 CLI — 企业微信开放平台命令行工具，支持人类和 AI Agent 使用 | `opencli wecom-cli msg send --to user "hello"` |
+| **tg(tg-cli)** | Telegram CLI — 基于 MTProto 的本地优先同步、搜索、导出，面向 AI Agent | `opencli tg search "AI news" -f json` |
+| **discord(discord-cli)** | Discord CLI — 基于 SQLite 的本地优先同步、搜索、导出，面向 AI Agent | `opencli discord recent --channel general` |
+| **wx(wx-cli)** | 微信本地数据 CLI — 会话、聊天记录、搜索、联系人、导出 | `opencli wx search "OpenCLI"` |
 | **vercel** | Vercel — 部署项目、管理域名、环境变量、日志 | `opencli vercel deploy --prod` |
 
 **零配置透传**：OpenCLI 会把你的输入原样转发给底层二进制，保留原生 stdout / stderr 行为。
 
-**自动安装**：如果你运行 `opencli gh ...` 时系统中还没有 `gh`，OpenCLI 会优先尝试通过系统包管理器安装，然后自动重试命令。
+**自动安装**：如果某个外部 CLI 配置了安全的包管理器安装命令，OpenCLI 会优先尝试安装后再执行；`ntn` 的官方安装方式是 shell 脚本，请先按 <https://ntn.dev> 手动安装。
 
 **注册自定义本地 CLI**：
 
@@ -359,7 +365,6 @@ opencli register mycli
 | **Antigravity** | 在终端直接控制 Antigravity Ultra | [Doc](./docs/adapters/desktop/antigravity.md) |
 | **ChatGPT App** | 自动化操作 ChatGPT macOS 桌面客户端 | [Doc](./docs/adapters/desktop/chatgpt-app.md) |
 | **ChatWise** | 多 LLM 客户端（GPT-4、Claude、Gemini） | [Doc](./docs/adapters/desktop/chatwise.md) |
-| **Notion** | 搜索、读取、写入 Notion 页面 | [Doc](./docs/adapters/desktop/notion.md) |
 | **Discord** | Discord 桌面版 — 消息、频道、服务器 | [Doc](./docs/adapters/desktop/discord.md) |
 | **Doubao** | 通过 CDP 控制豆包桌面应用 | [Doc](./docs/adapters/desktop/doubao-app.md) |
 
@@ -398,6 +403,7 @@ brew install yt-dlp
 # 下载小红书笔记中的图片/视频
 opencli xiaohongshu download "https://www.xiaohongshu.com/search_result/<id>?xsec_token=..." --output ./xhs
 opencli xiaohongshu download "https://xhslink.com/..." --output ./xhs
+opencli rednote download "https://www.rednote.com/search_result/<id>?xsec_token=..." --output ./rednote
 
 # 下载B站视频（需要 yt-dlp）
 opencli bilibili download BV1xxx --output ./bilibili
@@ -505,10 +511,10 @@ opencli plugin uninstall my-tool                            # 卸载
 在动代码前，先读 [`opencli-adapter-author` skill](./skills/opencli-adapter-author/SKILL.md)。它把整个流程串起来：
 
 - 侦察站点，选定 pattern（SPA / SSR / JSONP / Token / Streaming）
-- 用 `opencli browser network`、`eval`、interceptor 等找到目标 endpoint
+- 用 `opencli browser <name> network`、`eval`、interceptor 等找到目标 endpoint
 - 定认证策略（`PUBLIC` / `COOKIE` / `INTERCEPT` / `UI` / `LOCAL`）
-- 先用 `opencli browser analyze <url>` 一步侦察，再字段解码、设计 columns、`opencli browser init` 生成骨架
-- 交付前用 `opencli browser verify <site>/<name>` 验证
+- 先用 `opencli browser recon analyze <url>` 一步侦察，再字段解码、设计 columns、`opencli browser recon init` 生成骨架
+- 交付前用 `opencli browser recon verify <site>/<name>` 验证
 
 在仓库外写的私有适配器放到 `~/.opencli/clis/<site>/<name>.js`；每个站点的 endpoint、字段映射、抓包样本会累积在 `~/.opencli/sites/<site>/`，下次写同站点的其他命令可以直接复用。
 
