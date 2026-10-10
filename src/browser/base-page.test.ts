@@ -58,6 +58,18 @@ class ActionPage extends BasePage {
 
 const resolveOk = { ok: true, matches_n: 1, match_level: 'exact' };
 
+describe('BasePage capability boundary', () => {
+  it('does not expose CDP-only capabilities on transport-neutral pages', () => {
+    const page = new TestPage() as unknown as Record<string, unknown>;
+
+    expect('cdp' in page).toBe(false);
+    expect('handleJavaScriptDialog' in page).toBe(false);
+    expect('nativeClick' in page).toBe(false);
+    expect('nativeType' in page).toBe(false);
+    expect('nativeKeyPress' in page).toBe(false);
+  });
+});
+
 describe('BasePage.fetchJson', () => {
   it('passes a narrow browser-context JSON request and parses the response in Node', async () => {
     const page = new TestPage();
@@ -288,7 +300,7 @@ describe('BasePage native input routing', () => {
       .mockResolvedValueOnce({ root: { nodeId: 1 } })
       .mockResolvedValueOnce({ nodeId: 9 })
       .mockResolvedValueOnce({});
-    page.results = [resolveOk, { x: 50, y: 100, w: 200, h: 32, visible: true }];
+    page.results = [resolveOk, { x: 50, y: 100, w: 200, h: 32, visible: true, hit: 'target' }];
     page.withArgsResults = [{ ok: true, multiple: false, accept: 'application/pdf' }, undefined];
 
     await page.click('#save');
@@ -301,7 +313,7 @@ describe('BasePage native input routing', () => {
   it('clicks via CDP Input.dispatchMouseEvent when rect is visible', async () => {
     const page = new ActionPage();
     page.nativeClick = vi.fn().mockResolvedValue(undefined);
-    page.results = [resolveOk, { x: 50, y: 100, w: 200, h: 32, visible: true }];
+    page.results = [resolveOk, { x: 50, y: 100, w: 200, h: 32, visible: true, hit: 'target' }];
 
     await page.click('#category');
 
@@ -336,7 +348,7 @@ describe('BasePage native input routing', () => {
     });
 
     await expect(page.snapshot({ source: 'ax' })).resolves.toContain('[1]button "Submit"');
-    await expect(page.click('1')).resolves.toEqual({ matches_n: 1, match_level: 'exact' });
+    await expect(page.click('1')).resolves.toEqual({ matches_n: 1, match_level: 'exact', click_method: 'ax' });
 
     expect(page.cdp).toHaveBeenNthCalledWith(1, 'Accessibility.enable', {});
     expect(page.cdp).toHaveBeenNthCalledWith(2, 'Accessibility.getFullAXTree', {});
@@ -399,7 +411,7 @@ describe('BasePage native input routing', () => {
     expect(snapshot).toContain('frame "https://other.example/embed":');
     expect(snapshot).toContain('[3]button "Cross Save"');
 
-    await expect(page.click('2')).resolves.toEqual({ matches_n: 1, match_level: 'exact' });
+    await expect(page.click('2')).resolves.toEqual({ matches_n: 1, match_level: 'exact', click_method: 'ax' });
 
     expect(page.cdp).toHaveBeenCalledWith('Accessibility.getFullAXTree', { frameId: 'same-frame' });
     expect(page.cdp).toHaveBeenCalledWith('Accessibility.enable', { frameId: 'cross-frame', sessionId: 'target', targetUrl: 'https://other.example/embed' });
@@ -439,7 +451,7 @@ describe('BasePage native input routing', () => {
 
     const snapshot = await page.snapshot({ source: 'ax' }) as string;
     expect(snapshot).toContain('[1]button "Cross Save"');
-    await expect(page.click('1')).resolves.toEqual({ matches_n: 1, match_level: 'exact' });
+    await expect(page.click('1')).resolves.toEqual({ matches_n: 1, match_level: 'exact', click_method: 'ax' });
 
     expect(page.cdp).toHaveBeenCalledWith('Accessibility.enable', { frameId: 'cross-frame', sessionId: 'target', targetUrl: 'https://other.example/embed' });
     expect(page.cdp).toHaveBeenCalledWith('Accessibility.getFullAXTree', { frameId: 'cross-frame', sessionId: 'target', targetUrl: 'https://other.example/embed' });
@@ -481,7 +493,7 @@ describe('BasePage native input routing', () => {
     });
 
     await page.snapshot({ source: 'ax' });
-    await expect(page.click('1')).resolves.toEqual({ matches_n: 1, match_level: 'reidentified' });
+    await expect(page.click('1')).resolves.toEqual({ matches_n: 1, match_level: 'reidentified', click_method: 'ax' });
 
     expect(page.cdp).toHaveBeenCalledWith('Accessibility.enable', { frameId: 'cross-frame', sessionId: 'target', targetUrl: 'https://other.example/embed' });
     expect(page.cdp).toHaveBeenCalledWith('Accessibility.getFullAXTree', { frameId: 'cross-frame', sessionId: 'target', targetUrl: 'https://other.example/embed' });
@@ -528,7 +540,7 @@ describe('BasePage native input routing', () => {
     });
 
     await page.snapshot({ source: 'ax' });
-    await expect(page.click('2')).resolves.toEqual({ matches_n: 1, match_level: 'reidentified' });
+    await expect(page.click('2')).resolves.toEqual({ matches_n: 1, match_level: 'reidentified', click_method: 'ax' });
 
     expect(page.cdp).toHaveBeenCalledWith('Accessibility.enable', {});
     expect(page.cdp).toHaveBeenCalledWith('Accessibility.getFullAXTree', { frameId: 'same-frame' });
@@ -559,7 +571,7 @@ describe('BasePage native input routing', () => {
     });
 
     await page.snapshot({ source: 'ax' });
-    await expect(page.click('1')).resolves.toEqual({ matches_n: 1, match_level: 'reidentified' });
+    await expect(page.click('1')).resolves.toEqual({ matches_n: 1, match_level: 'reidentified', click_method: 'ax' });
 
     expect(page.cdp).toHaveBeenCalledWith('DOM.getBoxModel', { backendNodeId: 10 });
     expect(page.cdp).toHaveBeenCalledWith('DOM.getBoxModel', { backendNodeId: 42 });
@@ -592,7 +604,7 @@ describe('BasePage native input routing', () => {
     for (let i = 0; i < 10; i++) {
       staleBackendIds.add(currentBackendId);
       currentBackendId += 1;
-      await expect(page.click('1')).resolves.toEqual({ matches_n: 1, match_level: 'reidentified' });
+      await expect(page.click('1')).resolves.toEqual({ matches_n: 1, match_level: 'reidentified', click_method: 'ax' });
     }
 
     expect(page.nativeClick).toHaveBeenCalledTimes(10);
@@ -637,7 +649,7 @@ describe('BasePage native input routing', () => {
     page.nativeClick = nativeClick;
     page.results = [
       resolveOk,
-      { x: 10, y: 20, w: 100, h: 30, visible: true },
+      { x: 10, y: 20, w: 100, h: 30, visible: true, hit: 'target' },
       { status: 'js_failed', x: 10, y: 20, error: 'click intercepted' },
     ];
 
@@ -710,7 +722,7 @@ describe('BasePage native input routing', () => {
       resolveOk,
       { ok: true, checked: false, disabled: false, kind: 'checkbox' },
       resolveOk,
-      { x: 20, y: 30, w: 40, h: 20, visible: true },
+      { x: 20, y: 30, w: 40, h: 20, visible: true, hit: 'target' },
       { ok: true, checked: true, disabled: false, kind: 'checkbox' },
     ];
 
@@ -872,5 +884,70 @@ describe('BasePage native input routing', () => {
     expect(page.scripts).toHaveLength(1);
     expect(page.scripts[0]).toContain('key: "N"');
     expect(page.scripts[0]).toContain('metaKey: true');
+  });
+});
+
+describe('BasePage.evaluateWithArgs scoping', () => {
+  class EvalCapturePage extends BasePage {
+    scripts: string[] = [];
+    async goto(): Promise<void> {}
+    async evaluate<T = unknown>(js: string): Promise<T>;
+    async evaluate<Args extends unknown[], T>(fn: BrowserEvaluateFunction<Args, T>, ...args: Args): Promise<Awaited<T>>;
+    async evaluate(input: string | BrowserEvaluateFunction<unknown[], unknown>): Promise<unknown> {
+      const code = typeof input === 'string' ? input : input.toString();
+      this.scripts.push(code);
+      if (typeof input !== 'string') return null;
+      return globalThis.eval(input);
+    }
+    async getCookies(): Promise<[]> { return []; }
+    async screenshot(): Promise<string> { return ''; }
+    async tabs(): Promise<unknown[]> { return []; }
+    async selectTab(): Promise<void> {}
+  }
+
+  it('wraps declarations in a lexical block to avoid global const redeclaration', async () => {
+    const page = new EvalCapturePage();
+    const result = await page.evaluateWithArgs('(() => markerAttr)()', { markerAttr: 'test-value' });
+
+    expect(result).toBe('test-value');
+    expect(page.scripts).toHaveLength(1);
+    const code = page.scripts[0];
+    // Must be wrapped in a lexical block, not bare top-level const.
+    expect(code).toMatch(/^\{\n/);
+    expect(code).toContain('const markerAttr = "test-value"');
+  });
+
+  it('allows same arg name across multiple calls without conflict', async () => {
+    const page = new EvalCapturePage();
+    await expect(page.evaluateWithArgs('(() => x)()', { x: 'first' })).resolves.toBe('first');
+    await expect(page.evaluateWithArgs('(() => x)()', { x: 'second' })).resolves.toBe('second');
+
+    expect(page.scripts).toHaveLength(2);
+    // Both should be self-contained blocks, not polluting global scope.
+    expect(page.scripts[0]).toContain('const x = "first"');
+    expect(page.scripts[1]).toContain('const x = "second"');
+    expect(page.scripts[0]).toMatch(/^\{\n/);
+    expect(page.scripts[1]).toMatch(/^\{\n/);
+  });
+
+  it('preserves completion value semantics for statement snippets', async () => {
+    const page = new EvalCapturePage();
+
+    await expect(page.evaluateWithArgs(`
+      const local = value + 1;
+      local * 2
+    `, { value: 20 })).resolves.toBe(42);
+  });
+});
+
+describe('BasePage.sleep', () => {
+  it('is a pure client-side sleep that never evaluates page script', async () => {
+    const page = new ActionPage();
+    const evalSpy = vi.spyOn(page, 'evaluate');
+
+    await page.sleep(0);
+
+    expect(evalSpy).not.toHaveBeenCalled();
+    expect(page.scripts).toHaveLength(0);
   });
 });

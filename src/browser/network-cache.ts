@@ -13,6 +13,7 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import type { SafeNetworkRequest } from './network-request.js';
 
 export const DEFAULT_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -32,6 +33,8 @@ export interface CachedNetworkEntry {
     body_truncated?: boolean;
     body_full_size?: number;
     timestamp?: number;
+    /** Sanitized request context; credential values and opaque bodies are omitted. */
+    request?: SafeNetworkRequest;
 }
 
 export interface NetworkCacheFile {
@@ -63,7 +66,18 @@ export function saveNetworkCache(
         savedAt: new Date().toISOString(),
         entries,
     };
-    fs.writeFileSync(target, JSON.stringify(payload), 'utf-8');
+    // 0o600: entries can include auth tokens and PII from captured response
+    // bodies. fchmod before writing also tightens a pre-existing broad file.
+    let fd: number | undefined;
+    try {
+        fd = fs.openSync(target, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC, 0o600);
+        fs.fchmodSync(fd, 0o600);
+        fs.writeFileSync(fd, JSON.stringify(payload), 'utf8');
+    } finally {
+        if (fd !== undefined) {
+            fs.closeSync(fd);
+        }
+    }
 }
 
 export interface LoadOptions {

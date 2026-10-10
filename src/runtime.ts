@@ -1,31 +1,18 @@
 import { BrowserBridge, CDPBridge } from './browser/index.js';
 import type { IPage } from './types.js';
 import { TimeoutError } from './errors.js';
-import { isElectronApp } from './electron-apps.js';
-import { log } from './logger.js';
+import { DEFAULT_BROWSER_COMMAND_TIMEOUT, DEFAULT_BROWSER_CONNECT_TIMEOUT } from './browser/config.js';
+
+export { DEFAULT_BROWSER_COMMAND_TIMEOUT, DEFAULT_BROWSER_CONNECT_TIMEOUT };
 
 /**
- * Returns the appropriate browser factory based on site type.
- * Uses CDPBridge for registered Electron apps, otherwise BrowserBridge.
+ * Returns the appropriate browser factory based on explicit configuration.
+ * A manual CDP endpoint uses CDPBridge; otherwise use BrowserBridge.
  */
-export function getBrowserFactory(site?: string): new () => IBrowserFactory {
-  if (site && isElectronApp(site)) return CDPBridge;
+export function getBrowserFactory(): new () => IBrowserFactory {
+  if (process.env.OPENCLI_CDP_ENDPOINT) return CDPBridge;
   return BrowserBridge;
 }
-
-function parseEnvTimeout(envVar: string, fallback: number): number {
-  const raw = process.env[envVar];
-  if (raw === undefined) return fallback;
-  const parsed = parseInt(raw, 10);
-  if (Number.isNaN(parsed) || parsed <= 0) {
-    log.warn(`[runtime] Invalid ${envVar}="${raw}", using default ${fallback}s`);
-    return fallback;
-  }
-  return parsed;
-}
-
-export const DEFAULT_BROWSER_CONNECT_TIMEOUT = parseEnvTimeout('OPENCLI_BROWSER_CONNECT_TIMEOUT', 30);
-export const DEFAULT_BROWSER_COMMAND_TIMEOUT = parseEnvTimeout('OPENCLI_BROWSER_COMMAND_TIMEOUT', 60);
 
 export type BrowserWindowMode = 'foreground' | 'background';
 export type BrowserSurface = 'browser' | 'adapter';
@@ -66,14 +53,14 @@ export function withTimeoutMs<T>(
 
 /** Interface for browser factory (BrowserBridge or test mocks) */
 export interface IBrowserFactory {
-  connect(opts?: { timeout?: number; session?: string; cdpEndpoint?: string; contextId?: string; idleTimeout?: number; windowMode?: BrowserWindowMode; surface?: BrowserSurface; siteSession?: 'ephemeral' | 'persistent' }): Promise<IPage>;
+  connect(opts?: { timeout?: number; session?: string; cdpEndpoint?: string; contextId?: string; preferredContextId?: string; idleTimeout?: number; windowMode?: BrowserWindowMode; surface?: BrowserSurface; siteSession?: 'ephemeral' | 'persistent' }): Promise<IPage>;
   close(): Promise<void>;
 }
 
 export async function browserSession<T>(
   BrowserFactory: new () => IBrowserFactory,
   fn: (page: IPage) => Promise<T>,
-  opts: { session?: string; cdpEndpoint?: string; contextId?: string; idleTimeout?: number; windowMode?: BrowserWindowMode; surface?: BrowserSurface; siteSession?: 'ephemeral' | 'persistent' } = {},
+  opts: { session?: string; cdpEndpoint?: string; contextId?: string; preferredContextId?: string; idleTimeout?: number; windowMode?: BrowserWindowMode; surface?: BrowserSurface; siteSession?: 'ephemeral' | 'persistent' } = {},
 ): Promise<T> {
   const browser = new BrowserFactory();
   try {
@@ -82,6 +69,7 @@ export async function browserSession<T>(
       session: opts.session,
       cdpEndpoint: opts.cdpEndpoint,
       contextId: opts.contextId,
+      preferredContextId: opts.preferredContextId,
       idleTimeout: opts.idleTimeout,
       windowMode: opts.windowMode,
       surface: opts.surface,

@@ -502,14 +502,6 @@
     ]
   },
   {
-    "command": "jike/notifications",
-    "file": "clis/jike/notifications.js",
-    "missing": [
-      "actionType",
-      "fromUser"
-    ]
-  },
-  {
     "command": "jike/topic",
     "file": "clis/jike/topic.js",
     "missing": [
@@ -583,13 +575,6 @@
     ]
   },
   {
-    "command": "reddit/popular",
-    "file": "clis/reddit/popular.js",
-    "missing": [
-      "author"
-    ]
-  },
-  {
     "command": "tieba/search",
     "file": "clis/tieba/search.js",
     "missing": [
@@ -610,30 +595,6 @@
     "file": "clis/twitter/bookmarks.js",
     "missing": [
       "name"
-    ]
-  },
-  {
-    "command": "twitter/download",
-    "file": "clis/twitter/download.js",
-    "missing": [
-      "poster",
-      "url"
-    ]
-  },
-  {
-    "command": "twitter/download",
-    "file": "clis/twitter/download.js",
-    "missing": [
-      "url"
-    ]
-  },
-  {
-    "command": "twitter/list-remove",
-    "file": "clis/twitter/list-remove.js",
-    "missing": [
-      "method",
-      "ts",
-      "url"
     ]
   },
   {
@@ -764,19 +725,6 @@
     ]
   },
   {
-    "command": "xianyu/chat",
-    "file": "clis/xianyu/chat.js",
-    "missing": [
-      "can_input",
-      "can_send",
-      "item_url",
-      "peer_masked_id",
-      "requiresAuth",
-      "title",
-      "visible_messages"
-    ]
-  },
-  {
     "command": "xianyu/item",
     "file": "clis/xianyu/item.js",
     "missing": [
@@ -794,14 +742,6 @@
       "seller_score",
       "seller_url",
       "status"
-    ]
-  },
-  {
-    "command": "xianyu/search",
-    "file": "clis/xianyu/search.js",
-    "missing": [
-      "extra",
-      "original_price"
     ]
   },
   {
@@ -933,13 +873,6 @@
     "file": "clis/zhihu/hot.js",
     "missing": [
       "url"
-    ]
-  },
-  {
-    "command": "zhihu/search",
-    "file": "clis/zhihu/search.js",
-    "missing": [
-      "excerpt"
     ]
   },
   {

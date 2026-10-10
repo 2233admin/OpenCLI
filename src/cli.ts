@@ -16,25 +16,30 @@ import { serializeCommand, formatArgSummary } from './serialization.js';
 import { render as renderOutput } from './output.js';
 import { PKG_VERSION } from './version.js';
 import { printCompletionScript } from './completion.js';
-import { loadExternalClis, executeExternalCli, installExternalCli, registerExternalCli, isBinaryInstalled, formatExternalCliLabel } from './external.js';
+import { listOpenCliSkills, readOpenCliSkill } from './skills.js';
 import { registerAllCommands } from './commanderAdapter.js';
-import { classifyAdapter, formatRootAdapterHelpText, installCommanderNamespaceStructuredHelp, installStructuredHelp, leadingPositionalFromUsage, rootHelpData, type RootAdapterGroups } from './help.js';
-import { EXIT_CODES, getErrorMessage, BrowserConnectError } from './errors.js';
+import { formatRootAdapterHelpText, installCommanderNamespaceStructuredHelp, installStructuredHelp, leadingPositionalFromUsage, rootHelpData, type RootAdapterGroups } from './help.js';
+import { EXIT_CODES, getErrorMessage, BrowserConnectError, CliError } from './errors.js';
 import { TargetError, type TargetErrorCode } from './browser/target-errors.js';
 import { resolveTargetJs, getTextResolvedJs, getValueResolvedJs, getAttributesResolvedJs, selectResolvedJs, isAutocompleteResolvedJs, type ResolveOptions, type TargetMatchLevel } from './browser/target-resolver.js';
 import { buildFindJs, buildSemanticFindJs, isFindError, type FindResult, type FindError, type SemanticFindOptions } from './browser/find.js';
 import { inferShape } from './browser/shape.js';
 import { assignKeys } from './browser/network-key.js';
 import { DEFAULT_TTL_MS, findEntry, loadNetworkCache, saveNetworkCache, type CachedNetworkEntry } from './browser/network-cache.js';
+import { sanitizeCapturedRequest, sanitizeCapturedUrl, type SafeNetworkRequest } from './browser/network-request.js';
+import { NETWORK_INTERCEPTOR_JS } from './browser/network-interceptor.js';
 import { parseFilter, shapeMatchesFilter } from './browser/shape-filter.js';
 import { buildHtmlTreeJs, type HtmlTreeResult } from './browser/html-tree.js';
 import { buildExtractHtmlJs, runExtractFromHtml } from './browser/extract.js';
 import { analyzeSite, type PageSignals } from './browser/analyze.js';
+import { registerAuthCommands } from './commands/auth.js';
 import { daemonRestart, daemonStatus, daemonStop } from './commands/daemon.js';
 import { log } from './logger.js';
-import { bindTab, BrowserCommandError, fetchDaemonStatus, sendCommand } from './browser/daemon-client.js';
-import { aliasForContextId, loadProfileConfig, renameProfile, resolveProfileContextId, setDefaultProfile } from './browser/profile.js';
+import { bindTab, BrowserCommandError, sendCommand } from './browser/daemon-client.js';
+import { fetchDaemonStatus } from './browser/daemon-transport.js';
+import { aliasForContextId, loadProfileConfig, profileRouteParams, renameProfile, resolveProfileSelection, setDefaultProfile, type ProfileSelection } from './browser/profile.js';
 import { formatDaemonVersion, isDaemonStale } from './browser/daemon-version.js';
+import { DEFAULT_BROWSER_CONNECT_TIMEOUT } from './browser/config.js';
 import type { BrowserDownloadWaitResult, IPage, ScreenshotOptions } from './types.js';
 import type { BrowserWindowMode } from './runtime.js';
 
@@ -55,6 +60,8 @@ type BrowserNetworkItem = {
   bodyTruncated?: boolean;
   /** Epoch milliseconds when the request was observed. */
   timestamp?: number;
+  /** Sanitized request context captured by CDP. */
+  request?: SafeNetworkRequest;
 };
 
 function parseDurationMs(raw: unknown, flagName: string): number | null | { error: string } {
@@ -99,6 +106,80 @@ export function selectFreshByTimestamp<T extends { timestamp?: unknown }>(
   return { fresh, lastSeenTs: nextSeenTs };
 }
 
+const STATIC_IMPORT_SPECIFIER_RE = /^\s*(?:import\s+(?:[^;]*?\s+from\s*)?|export\s+(?:\*(?:\s+as\s+[\w$]+)?|{[^;]*?})\s+from\s*)['"]([^'"]+)['"]/gm;
+const DYNAMIC_IMPORT_SPECIFIER_RE = /(?:^|[^\w$])import\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
+
+function isPathInside(child: string, parent: string): boolean {
+  const relative = path.relative(parent, child);
+  return relative === '' || (!!relative && !relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function listJsFiles(dir: string): string[] {
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
+  const files: string[] = [];
+  for (const entry of entries) {
+    const fullPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...listJsFiles(fullPath));
+    } else if (entry.isFile() && entry.name.endsWith('.js')) {
+      files.push(fullPath);
+    }
+  }
+  return files;
+}
+
+function extractImportSpecifiers(source: string): string[] {
+  const specifiers: string[] = [];
+  for (const pattern of [STATIC_IMPORT_SPECIFIER_RE, DYNAMIC_IMPORT_SPECIFIER_RE]) {
+    pattern.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(source)) !== null) {
+      specifiers.push(match[1]);
+    }
+  }
+  return specifiers;
+}
+
+function resolveImportTarget(importerPath: string, specifier: string): string | null {
+  if (!specifier.startsWith('.')) return null;
+  const base = path.resolve(path.dirname(importerPath), specifier);
+  const candidates = path.extname(base) ? [base] : [base, `${base}.js`, path.join(base, 'index.js')];
+  return candidates.find(candidate => fs.existsSync(candidate)) ?? base;
+}
+
+function collectRepoSharedDependencies(entryDir: string, sharedDir: string): string[] {
+  const pending = listJsFiles(entryDir);
+  const seenFiles = new Set<string>();
+  const sharedDeps = new Set<string>();
+
+  for (let index = 0; index < pending.length; index += 1) {
+    const filePath = pending[index];
+    if (seenFiles.has(filePath)) continue;
+    seenFiles.add(filePath);
+
+    const source = fs.readFileSync(filePath, 'utf-8');
+    for (const specifier of extractImportSpecifiers(source)) {
+      const resolved = resolveImportTarget(filePath, specifier);
+      if (!resolved || !isPathInside(resolved, sharedDir)) continue;
+      sharedDeps.add(resolved);
+      if (fs.existsSync(resolved) && fs.statSync(resolved).isFile()) pending.push(resolved);
+      else if (fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()) pending.push(...listJsFiles(resolved));
+    }
+  }
+
+  return [...sharedDeps].sort();
+}
+
+function copyEjectedRepoSharedDependencies(builtinSiteDir: string, builtinSharedDir: string, userClisDir: string): void {
+  const sharedDeps = collectRepoSharedDependencies(builtinSiteDir, builtinSharedDir);
+  for (const source of sharedDeps) {
+    const relative = path.relative(builtinSharedDir, source);
+    const target = path.join(userClisDir, '_shared', relative);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.cpSync(source, target, { recursive: true });
+  }
+}
+
 /**
  * Normalize raw capture entries (from daemon/CDP `readNetworkCapture` or
  * the JS interceptor's `window.__opencli_net`) into a consistent shape.
@@ -120,8 +201,15 @@ async function captureNetworkItems(page: import('./types.js').IPage): Promise<Br
           ? (e.responseBodyFullSize as number)
           : (preview ? preview.length : 0);
         const truncated = e.responseBodyTruncated === true;
+        const request = sanitizeCapturedRequest({
+          headers: e.requestHeaders,
+          bodyKind: e.requestBodyKind,
+          bodyPreview: e.requestBodyPreview,
+          bodyFullSize: e.requestBodyFullSize,
+          bodyTruncated: e.requestBodyTruncated,
+        });
         return {
-          url: (e.url as string) || '',
+          url: sanitizeCapturedUrl((e.url as string) || ''),
           method: (e.method as string) || 'GET',
           status: (e.responseStatus as number) || 0,
           size: fullSize,
@@ -130,6 +218,7 @@ async function captureNetworkItems(page: import('./types.js').IPage): Promise<Br
           bodyFullSize: fullSize,
           bodyTruncated: truncated,
           timestamp: timestampFromRaw(e.timestamp),
+          ...(request ? { request } : {}),
         };
       });
     }
@@ -137,7 +226,11 @@ async function captureNetworkItems(page: import('./types.js').IPage): Promise<Br
   const raw = await page.evaluate(`(function(){ var out = window.__opencli_net || []; window.__opencli_net = []; return JSON.stringify(out); })()`) as string;
   try {
     const parsed = JSON.parse(raw) as BrowserNetworkItem[];
-    return parsed.map((item) => ({ ...item, timestamp: timestampFromRaw(item.timestamp) }));
+    return parsed.map((item) => ({
+      ...item,
+      url: sanitizeCapturedUrl(item.url),
+      timestamp: timestampFromRaw(item.timestamp),
+    }));
   } catch {
     if (process.env.OPENCLI_VERBOSE) log.warn(`[network] Failed to parse interceptor buffer: ${typeof raw === 'string' ? raw.slice(0, 200) : String(raw)}`);
     return [];
@@ -145,11 +238,11 @@ async function captureNetworkItems(page: import('./types.js').IPage): Promise<Br
 }
 
 /** Drop static-resource / telemetry noise so agents see only API-shaped traffic. */
-function filterNetworkItems(items: BrowserNetworkItem[]): BrowserNetworkItem[] {
+function filterNetworkItems<T extends Pick<BrowserNetworkItem, 'url' | 'ct'>>(items: T[]): T[] {
   return items.filter((r) => {
     const ct = r.ct?.toLowerCase() ?? '';
     return (
-      (ct.includes('json') || ct.includes('xml') || ct.includes('text/plain') || ct.includes('javascript')) &&
+      (ct.includes('json') || ct.includes('xml') || ct.includes('text/plain') || ct.includes('javascript') || ct.includes('text/x-component') || /\/rsc-action(?:\/|\?|$)/i.test(r.url)) &&
       !/\.(js|css|png|jpg|gif|svg|woff|ico|map)(\?|$)/i.test(r.url) &&
       !/analytics|tracking|telemetry|beacon|pixel|gtag|fbevents/i.test(r.url)
     );
@@ -376,7 +469,7 @@ async function resolveStoredBrowserTarget(page: import('./types.js').IPage, scop
 async function getBrowserPage(
   session: string,
   targetPage?: string,
-  contextId?: string,
+  profileSelection?: ProfileSelection,
   opts: { windowMode?: BrowserWindowMode } = {},
 ): Promise<import('./types.js').IPage> {
   const { BrowserBridge } = await import('./browser/index.js');
@@ -385,14 +478,14 @@ async function getBrowserPage(
   const envTimeout = process.env.OPENCLI_BROWSER_IDLE_TIMEOUT;
   const idleTimeout = envTimeout ? parseInt(envTimeout, 10) : undefined;
   const page = await bridge.connect({
-    timeout: 30,
+    timeout: DEFAULT_BROWSER_CONNECT_TIMEOUT,
     session,
     surface: 'browser',
-    ...(contextId && { contextId }),
+    ...profileRouteParams(profileSelection),
     ...(idleTimeout && idleTimeout > 0 && { idleTimeout }),
     windowMode: opts.windowMode ?? getBrowserWindowMode(undefined, 'foreground'),
   });
-  const targetScope = getBrowserScope(session, contextId);
+  const targetScope = getBrowserScope(session, profileSelection?.contextId);
   const resolvedTargetPage = targetPage
     ? await resolveBrowserTargetInSession(page, targetPage, { scope: targetScope, source: 'explicit' })
     : await resolveStoredBrowserTarget(page, targetScope);
@@ -448,9 +541,9 @@ function getBrowserSession(command?: Command): string {
   throw new Error('<session> is a required positional argument: opencli browser <session> <command>');
 }
 
-function getBrowserContextId(command?: Command): string | undefined {
+function getBrowserProfileSelection(command?: Command): ProfileSelection | undefined {
   const raw = getCommandOption(command, 'profile');
-  return resolveProfileContextId(typeof raw === 'string' && raw.trim() ? raw.trim() : undefined);
+  return resolveProfileSelection(typeof raw === 'string' && raw.trim() ? raw.trim() : undefined);
 }
 
 function getPageSession(page: import('./types.js').IPage): string {
@@ -460,8 +553,15 @@ function getPageSession(page: import('./types.js').IPage): string {
 }
 
 function getPageScope(page: import('./types.js').IPage): string {
-  const contextId = (page as unknown as { contextId?: unknown }).contextId;
-  return getBrowserScope(getPageSession(page), typeof contextId === 'string' && contextId.trim() ? contextId.trim() : undefined);
+  // Scope is keyed by the SELECTED profile (explicit or preferred), matching
+  // getBrowserPage's targetScope — reading only the explicit contextId would
+  // save and look up the remembered tab under different keys whenever the
+  // profile came from the config default.
+  const { contextId, preferredContextId } = page as unknown as { contextId?: unknown; preferredContextId?: unknown };
+  const selected = typeof contextId === 'string' && contextId.trim()
+    ? contextId.trim()
+    : (typeof preferredContextId === 'string' && preferredContextId.trim() ? preferredContextId.trim() : undefined);
+  return getBrowserScope(getPageSession(page), selected);
 }
 
 type SnapshotSource = 'dom' | 'ax';
@@ -551,8 +651,7 @@ function applyRootSubcommandSummaries(program: Command): void {
 
 export function createProgram(BUILTIN_CLIS: string, USER_CLIS: string): Command {
   const program = new Command();
-  // enablePositionalOptions: prevents parent from consuming flags meant for subcommands;
-  // prerequisite for passThroughOptions to forward --help/--version to external binaries
+  // Prevent the parent from consuming flags meant for subcommands.
   program
     .name('opencli')
     .description('Make any website your CLI. Zero setup. AI-powered.')
@@ -596,18 +695,14 @@ export function createProgram(BUILTIN_CLIS: string, USER_CLIS: string): Command 
         return;
       }
 
-      // Table (default) — grouped by site
-      const sites = new Map<string, CliCommand[]>();
+      const sitesBySite = new Map<string, CliCommand[]>();
       for (const cmd of commands) {
-        const g = sites.get(cmd.site) ?? [];
+        const g = sitesBySite.get(cmd.site) ?? [];
         g.push(cmd);
-        sites.set(cmd.site, g);
+        sitesBySite.set(cmd.site, g);
       }
 
-      console.log();
-      console.log('  opencli' + ' — available commands');
-      console.log();
-      for (const [site, cmds] of sites) {
+      const renderSiteGroup = (site: string, cmds: CliCommand[]): void => {
         console.log(`  ${site}`);
         for (const cmd of cmds) {
           const label = strategyLabel(cmd);
@@ -618,20 +713,19 @@ export function createProgram(BUILTIN_CLIS: string, USER_CLIS: string): Command 
           console.log(`    ${cmd.name} ${tag}${aliases}${cmd.description ? ` — ${cmd.description}` : ''}`);
         }
         console.log();
-      }
+      };
 
-      const externalClis = loadExternalClis();
-      if (externalClis.length > 0) {
-        console.log('  external CLIs');
-        for (const ext of externalClis) {
-          const isInstalled = isBinaryInstalled(ext.binary);
-          const tag = isInstalled ? '[installed]' : '[auto-install]';
-          console.log(`    ${formatExternalCliLabel(ext)} ${tag}${ext.description ? ` — ${ext.description}` : ''}`);
-        }
+      console.log();
+      console.log('  opencli' + ' — available commands');
+      console.log();
+
+      if (sitesBySite.size > 0) {
+        console.log('  Site adapters');
         console.log();
+        for (const [site, cmds] of sitesBySite) renderSiteGroup(site, cmds);
       }
 
-      console.log(`  ${commands.length} built-in commands across ${sites.size} sites, ${externalClis.length} external CLIs`);
+      console.log(`  ${commands.length} built-in commands across ${sitesBySite.size} sites`);
       console.log();
     });
 
@@ -643,7 +737,7 @@ export function createProgram(BUILTIN_CLIS: string, USER_CLIS: string): Command 
     .argument('[target]', 'site or site/name')
     .action(async (target) => {
       const { validateClisWithTarget, renderValidationReport } = await import('./validate.js');
-      console.log(renderValidationReport(validateClisWithTarget([BUILTIN_CLIS, USER_CLIS], target)));
+      console.log(renderValidationReport(validateClisWithTarget(target)));
     });
 
   program
@@ -657,6 +751,51 @@ export function createProgram(BUILTIN_CLIS: string, USER_CLIS: string): Command 
       console.log(renderVerifyReport(r));
       process.exitCode = r.ok ? EXIT_CODES.SUCCESS : EXIT_CODES.GENERIC_ERROR;
     });
+
+  const skillsCmd = program
+    .command('skills')
+    .description('Read bundled OpenCLI skills');
+
+  skillsCmd
+    .command('list')
+    .description('List bundled opencli-* skills')
+    .option('-f, --format <fmt>', 'Output format: table, json, yaml, md, csv', 'table')
+    .action((opts) => {
+      const rows = listOpenCliSkills();
+      renderOutput(rows, {
+        fmt: opts.format,
+        fmtExplicit: !!opts.format,
+        columns: ['name', 'description', 'version', 'path'],
+        title: 'opencli/skills/list',
+        source: 'opencli skills list',
+      });
+    });
+
+  skillsCmd
+    .command('read')
+    .description("Print an opencli-* skill's SKILL.md or reference file")
+    .argument('<skill>', 'Skill name, or skill/path like opencli-browser/references/foo.md')
+    .argument('[path]', 'Path under the skill directory')
+    .option('--json', 'Output a JSON envelope instead of raw markdown', false)
+    .action((skill: string, skillPath: string | undefined, opts) => {
+      let result: ReturnType<typeof readOpenCliSkill>;
+      try {
+        result = readOpenCliSkill(skill, skillPath ?? '');
+      } catch (err) {
+        console.error(`Error: ${getErrorMessage(err)}`);
+        if (err instanceof CliError && err.hint) console.error(`Hint: ${err.hint}`);
+        process.exitCode = err instanceof CliError ? err.exitCode : EXIT_CODES.GENERIC_ERROR;
+        return;
+      }
+      if (opts.json) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+      process.stdout.write(result.content);
+      if (!result.content.endsWith('\n')) process.stdout.write('\n');
+    });
+
+  const authCmd = registerAuthCommands(program);
 
   program
     .command('convention-audit')
@@ -700,6 +839,7 @@ export function createProgram(BUILTIN_CLIS: string, USER_CLIS: string): Command 
 
 Examples:
   $ opencli browser work open https://x.com
+  $ opencli browser work open https://x.com --window background
   $ opencli browser work click 12
   $ opencli browser work state
   $ opencli browser work bind
@@ -775,17 +915,33 @@ Examples:
     }, null, 2));
   }
 
+  function emitBrowserCommandErrorEnvelope(err: BrowserCommandError): void {
+    if (!err.code) return;
+    console.log(JSON.stringify({
+      error: {
+        code: err.code,
+        message: err.message,
+        ...(err.hint ? { hint: err.hint } : {}),
+      },
+    }, null, 2));
+  }
+
+  function logBrowserCommandError(err: BrowserCommandError): void {
+    log.error(err.message);
+    if (err.hint) log.error(`Hint: ${err.hint}`);
+  }
+
   /** Wrap browser actions with error handling and optional --json output */
-  function browserAction(fn: (page: Awaited<ReturnType<typeof getBrowserPage>>, ...args: any[]) => Promise<unknown>) {
-    return async (...args: any[]) => {
+  function browserAction<Args extends unknown[]>(fn: (page: Awaited<ReturnType<typeof getBrowserPage>>, ...args: Args) => Promise<unknown>) {
+    return async (...args: Args) => {
       let page: Awaited<ReturnType<typeof getBrowserPage>> | null = null;
       try {
         const command = args.at(-1) instanceof Command ? args.at(-1) as Command : undefined;
         const targetPage = getBrowserTargetId(command);
         const session = getBrowserSession(command);
-        const contextId = getBrowserContextId(command);
+        const profileSelection = getBrowserProfileSelection(command);
         const windowMode = getBrowserWindowMode(command, 'foreground');
-        page = await getBrowserPage(session, targetPage, contextId, { windowMode });
+        page = await getBrowserPage(session, targetPage, profileSelection, { windowMode });
         await fn(page, ...args);
       } catch (err) {
         if (err instanceof BrowserConnectError) {
@@ -794,17 +950,10 @@ Examples:
         } else if (err instanceof BrowserCommandError) {
           if (isJavaScriptDialogMessage(err.message)) {
             emitJavaScriptDialogError(err.message);
-          } else if (err.code) {
-            console.log(JSON.stringify({
-              error: {
-                code: err.code,
-                message: err.message,
-                ...(err.hint ? { hint: err.hint } : {}),
-              },
-            }, null, 2));
+          } else {
+            emitBrowserCommandErrorEnvelope(err);
           }
-          log.error(err.message);
-          if (err.hint) log.error(`Hint: ${err.hint}`);
+          logBrowserCommandError(err);
         } else if (err instanceof TargetError) {
           // Agent-facing structured envelope on stdout + short human line on stderr.
           emitTargetError(err);
@@ -826,63 +975,49 @@ Examples:
     };
   }
 
-  browser.command('bind')
-    .description('Bind the current Chrome tab/window to the browser session named by <session>')
-    .action(async (optsOrCommand, maybeCommand?: Command) => {
+  type BrowserSessionCommandContext = {
+    session: string;
+    contextId?: string;
+  };
+
+  function browserSessionCommandAction(fn: (ctx: BrowserSessionCommandContext) => Promise<void>) {
+    return async (optsOrCommand: unknown, maybeCommand?: Command) => {
       const command = optsOrCommand instanceof Command ? optsOrCommand : maybeCommand;
       const session = getBrowserSession(command);
+      const profileSelection = getBrowserProfileSelection(command);
+      const contextId = profileSelection?.contextId;
       try {
         const { BrowserBridge } = await import('./browser/index.js');
         const bridge = new BrowserBridge();
-        const contextId = getBrowserContextId(command);
-        await bridge.connect({ timeout: 30, session, surface: 'browser', ...(contextId && { contextId }) });
-        const data = await bindTab(session, { ...(contextId && { contextId }) });
-        saveBrowserTargetState(undefined, getBrowserScope(session, contextId));
-        console.log(JSON.stringify({ session, ...((data && typeof data === 'object') ? data as Record<string, unknown> : { data }) }, null, 2));
+        await bridge.connect({ timeout: DEFAULT_BROWSER_CONNECT_TIMEOUT, session, surface: 'browser', ...profileRouteParams(profileSelection) });
+        await fn({ session, contextId });
       } catch (err) {
-        if (err instanceof BrowserCommandError && err.code) {
-          console.log(JSON.stringify({
-            error: {
-              code: err.code,
-              message: err.message,
-              ...(err.hint ? { hint: err.hint } : {}),
-            },
-          }, null, 2));
+        if (err instanceof BrowserCommandError) {
+          emitBrowserCommandErrorEnvelope(err);
+          logBrowserCommandError(err);
+        } else {
+          log.error(err instanceof Error ? err.message : String(err));
         }
-        log.error(err instanceof Error ? err.message : String(err));
-        if (err instanceof BrowserCommandError && err.hint) log.error(`Hint: ${err.hint}`);
         process.exitCode = EXIT_CODES.GENERIC_ERROR;
       }
-    });
+    };
+  }
+
+  browser.command('bind')
+    .description('Bind the current Chrome tab/window to the browser session named by <session>')
+    .action(browserSessionCommandAction(async ({ session, contextId }) => {
+      const data = await bindTab(session, { ...(contextId && { contextId }) });
+      saveBrowserTargetState(undefined, getBrowserScope(session, contextId));
+      console.log(JSON.stringify({ session, ...((data && typeof data === 'object') ? data as Record<string, unknown> : { data }) }, null, 2));
+    }));
 
   browser.command('unbind')
     .description('Detach the bound browser session named by <session> without closing the user tab/window')
-    .action(async (optsOrCommand, maybeCommand?: Command) => {
-      const command = optsOrCommand instanceof Command ? optsOrCommand : maybeCommand;
-      const session = getBrowserSession(command);
-      try {
-        const { BrowserBridge } = await import('./browser/index.js');
-        const bridge = new BrowserBridge();
-        const contextId = getBrowserContextId(command);
-        await bridge.connect({ timeout: 30, session, surface: 'browser', ...(contextId && { contextId }) });
-        await sendCommand('close-window', { session, surface: 'browser', ...(contextId && { contextId }) });
-        saveBrowserTargetState(undefined, getBrowserScope(session, contextId));
-        console.log(JSON.stringify({ unbound: true, session }, null, 2));
-      } catch (err) {
-        if (err instanceof BrowserCommandError && err.code) {
-          console.log(JSON.stringify({
-            error: {
-              code: err.code,
-              message: err.message,
-              ...(err.hint ? { hint: err.hint } : {}),
-            },
-          }, null, 2));
-        }
-        log.error(err instanceof Error ? err.message : String(err));
-        if (err instanceof BrowserCommandError && err.hint) log.error(`Hint: ${err.hint}`);
-        process.exitCode = EXIT_CODES.GENERIC_ERROR;
-      }
-    });
+    .action(browserSessionCommandAction(async ({ session, contextId }) => {
+      await sendCommand('close-window', { session, surface: 'browser', ...(contextId && { contextId }) });
+      saveBrowserTargetState(undefined, getBrowserScope(session, contextId));
+      console.log(JSON.stringify({ unbound: true, session }, null, 2));
+    }));
 
   const browserTab = browser
     .command('tab')
@@ -950,20 +1085,8 @@ Examples:
 
   // ── Navigation ──
 
-  /**
-   * Network interceptor JS — injected on every open/navigate to capture
-   * fetch/XHR bodies when the session-level capture channel (CDP/extension)
-   * isn't available. Keeps parity with the CDP path's truncation contract:
-   * when a body exceeds the per-entry cap, we keep a string prefix and set
-   * `bodyTruncated: true` + `bodyFullSize: <original length>` so `browser
-   * network` can propagate a visible signal to the agent instead of
-   * silently dropping the body. Per-entry cap is 1 MiB and the ring is
-   * capped at 200 entries, bounding worst-case in-page memory.
-   */
-  const NETWORK_INTERCEPTOR_JS = `(function(){if(window.__opencli_net)return;window.__opencli_net=[];var M=200,B=1048576,F=window.fetch;function capture(url,method,status,text,ct){if(window.__opencli_net.length>=M)return;var full=text?text.length:0,trunc=full>B,stored=trunc?text.slice(0,B):text,body=null;if(stored){if(trunc){body=stored}else{try{body=JSON.parse(stored)}catch(e){body=stored}}}var e={url:url,method:method||'GET',status:status,size:full,ct:ct,body:body,timestamp:Date.now()};if(trunc){e.bodyTruncated=true;e.bodyFullSize=full}window.__opencli_net.push(e)}window.fetch=async function(){var r=await F.apply(this,arguments);try{var ct=r.headers.get('content-type')||'';if(ct.includes('json')||ct.includes('text')){var c=r.clone(),t=await c.text();capture(r.url||(arguments[0]&&arguments[0].url)||String(arguments[0]),(arguments[1]&&arguments[1].method)||'GET',r.status,t,ct)}}catch(e){}return r};var X=XMLHttpRequest.prototype,O=X.open,S=X.send;X.open=function(m,u){this._om=m;this._ou=u;return O.apply(this,arguments)};X.send=function(){var x=this;x.addEventListener('load',function(){try{var ct=x.getResponseHeader('content-type')||'';if(ct.includes('json')||ct.includes('text')){capture(x._ou,x._om||'GET',x.status,x.responseText||'',ct)}}catch(e){}});return S.apply(this,arguments)}})()`;
-
   addBrowserTabOption(browser.command('open').argument('<url>').description('Open URL in the browser session'))
-    .action(browserAction(async (page, url, opts) => {
+    .action(browserAction(async (page, url) => {
       // Start session-level capture before navigation (catches initial requests)
       const hasSessionCapture = await page.startNetworkCapture?.() ?? false;
       await page.goto(url);
@@ -972,14 +1095,15 @@ Examples:
       if (!hasSessionCapture) {
         try { await page.evaluate(NETWORK_INTERCEPTOR_JS); } catch { /* non-fatal */ }
       }
+      const currentUrl = await page.getCurrentUrl?.() ?? url;
       console.log(JSON.stringify({
-        url: await page.getCurrentUrl?.() ?? url,
+        url: currentUrl,
         ...(page.getActivePage?.() ? { page: page.getActivePage?.() } : {}),
       }, null, 2));
     }));
 
   addBrowserTabOption(browser.command('back').description('Go back in browser history'))
-    .action(browserAction(async (page, opts) => {
+    .action(browserAction(async (page) => {
       await page.evaluate('history.back()');
       await page.wait(2);
       console.log('Navigated back');
@@ -1134,6 +1258,7 @@ Examples:
   //
   //   - pattern: A/B/C/D (mapped from network + SSR-globals signals)
   //   - anti_bot: vendor + evidence + the one-liner for "what to do next"
+  //   - api_candidates: captured endpoints scored as real data vs telemetry
   //   - initial_state: which window globals are populated
   //   - nearest_adapter: existing commands for the same site, if any
   //   - recommended_next_step: a single imperative sentence
@@ -1142,7 +1267,7 @@ Examples:
   // feedback loop with a single deterministic verdict. Without this, agents
   // burn ~20min per WAF-protected site re-discovering anti-bot posture.
   addBrowserTabOption(browser.command('analyze').argument('<url>'))
-    .description('Classify site: anti-bot vendor, pattern (A/B/C/D), nearest adapter, recommended next step')
+    .description('Classify site: anti-bot vendor, real-data API candidates, pattern (A/B/C/D), nearest adapter, next step')
     .action(browserAction(async (page, url) => {
       const hasSessionCapture = await page.startNetworkCapture?.() ?? false;
       await page.goto(url);
@@ -1762,8 +1887,13 @@ Examples:
         process.exitCode = EXIT_CODES.USAGE_ERROR;
         return;
       }
-      const { matches_n, match_level } = await page.click(resolvedTarget, parsed.opts);
-      console.log(JSON.stringify({ clicked: true, target: resolvedTarget, matches_n, match_level }, null, 2));
+      const { matches_n, match_level, click_method, hit, retargeted } = await page.click(resolvedTarget, parsed.opts);
+      console.log(JSON.stringify({
+        clicked: true, target: resolvedTarget, matches_n, match_level,
+        ...(click_method && { click_method }),
+        ...(hit && { hit }),
+        ...(retargeted && { retargeted }),
+      }, null, 2));
     }));
 
   addBrowserTabOption(
@@ -2401,6 +2531,7 @@ Examples:
           ...(typeof entry.timestamp === 'number' ? { timestamp: toIsoTimestamp(entry.timestamp) } : {}),
           shape: inferShape(entry.body),
           body: outputBody,
+          ...(entry.request ? { request: entry.request } : {}),
         };
         if (captureTruncated || transportTruncated) {
           detailEnvelope.body_truncated = true;
@@ -2451,33 +2582,54 @@ Examples:
         return;
       }
 
-      let items = opts.all ? rawItems : filterNetworkItems(rawItems);
-      items = filterByTimeWindow(items, { sinceMs, untilMs });
-      if (opts.failed) items = items.filter((item) => item.status === 0 || item.status >= 400);
-      const filteredOut = rawItems.length - items.length;
+      let selectedRaw = filterByTimeWindow(rawItems, { sinceMs, untilMs });
+      if (opts.failed) selectedRaw = selectedRaw.filter((item) => item.status === 0 || item.status >= 400);
 
-      const keyed = assignKeys(items);
-      const cacheEntries: CachedNetworkEntry[] = keyed.map((it) => ({
-        key: it.key,
-        url: it.url,
-        method: it.method,
-        status: it.status,
-        size: it.size,
-        ct: it.ct,
-        body: it.body,
-        ...(typeof it.timestamp === 'number' ? { timestamp: it.timestamp } : {}),
-        ...(it.bodyTruncated ? { body_truncated: true } : {}),
-        ...(it.bodyTruncated && typeof it.bodyFullSize === 'number'
-          ? { body_full_size: it.bodyFullSize }
-          : {}),
-      }));
+      // The live CDP buffer is a destructive drain. Assign keys and persist
+      // the selected raw batch before applying display-only MIME/static/shape
+      // filters, otherwise a default call permanently destroys RSC and other
+      // non-standard responses before a later --all / --detail can inspect it.
+      const keyed = assignKeys(selectedRaw);
+      let cacheEntries: CachedNetworkEntry[] = keyed.map((it) => ({
+          key: it.key,
+          url: it.url,
+          method: it.method,
+          status: it.status,
+          size: it.size,
+          ct: it.ct,
+          body: it.body,
+          ...(typeof it.timestamp === 'number' ? { timestamp: it.timestamp } : {}),
+          ...(it.bodyTruncated ? { body_truncated: true } : {}),
+          ...(it.bodyTruncated && typeof it.bodyFullSize === 'number'
+            ? { body_full_size: it.bodyFullSize }
+            : {}),
+          ...(it.request ? { request: it.request } : {}),
+        }));
+
+      // A repeated call commonly sees an empty live batch because the first
+      // call drained it. Reuse the still-fresh raw cache instead of replacing
+      // it with an empty file, so `network` followed by `network --all` works.
+      let reusedCache = false;
+      if (rawItems.length === 0 && opts.all) {
+        const cached = loadNetworkCache(session, { ttlMs });
+        if (cached.status === 'ok' && cached.file) {
+          cacheEntries = filterByTimeWindow(cached.file.entries, { sinceMs, untilMs });
+          if (opts.failed) cacheEntries = cacheEntries.filter((item) => item.status === 0 || item.status >= 400);
+          reusedCache = true;
+        }
+      }
+
+      const displayEntries = opts.all ? cacheEntries : filterNetworkItems(cacheEntries);
+      const filteredOut = (reusedCache ? cacheEntries.length : rawItems.length) - displayEntries.length;
       // Soft failure: the caller already has the data, so surface a warning
       // via the output envelope rather than erroring out the whole command.
       let cacheWarning: string | null = null;
-      try {
-        saveNetworkCache(session, cacheEntries);
-      } catch (err) {
-        cacheWarning = `Could not persist capture cache: ${(err as Error).message}. --detail lookups may miss this capture.`;
+      if (!reusedCache && rawItems.length > 0) {
+        try {
+          saveNetworkCache(session, cacheEntries);
+        } catch (err) {
+          cacheWarning = `Could not persist capture cache: ${(err as Error).message}. --detail lookups may miss this capture.`;
+        }
       }
 
       // Pair each cache entry with its shape up front so --filter can read
@@ -2485,7 +2637,7 @@ Examples:
       // body. Cache persistence above stored the unfiltered set on purpose:
       // later `--detail <key>` lookups must still see requests that the
       // current --filter narrowed out.
-      const shaped = cacheEntries.map((e) => ({ entry: e, shape: inferShape(e.body) }));
+      const shaped = displayEntries.map((e) => ({ entry: e, shape: inferShape(e.body) }));
       const visible = filterFields
         ? shaped.filter((s) => shapeMatchesFilter(s.shape, filterFields))
         : shaped;
@@ -2497,6 +2649,7 @@ Examples:
         count: visible.length,
         filtered_out: filteredOut,
       };
+      if (reusedCache) envelope.cache_reused = true;
       if (filterFields) {
         envelope.filter = filterFields;
         envelope.filter_dropped = filterDropped;
@@ -3028,6 +3181,7 @@ cli({
       const os = await import('node:os');
       const userClisDir = path.join(os.homedir(), '.opencli', 'clis');
       const builtinSiteDir = path.join(BUILTIN_CLIS, site);
+      const builtinSharedDir = path.join(BUILTIN_CLIS, '_shared');
       const userSiteDir = path.join(userClisDir, site);
 
       try {
@@ -3046,6 +3200,7 @@ cli({
       } catch { /* good, doesn't exist yet */ }
 
       fs.cpSync(builtinSiteDir, userSiteDir, { recursive: true });
+      copyEjectedRepoSharedDependencies(builtinSiteDir, builtinSharedDir, userClisDir);
       console.log(`✅ Ejected "${site}" to ~/.opencli/clis/${site}/`);
       console.log('You can now edit the adapter files. Changes take effect immediately.');
       console.log('Note: Official updates to this adapter will overwrite your changes.');
@@ -3199,131 +3354,15 @@ cli({
     .description('Restart the daemon')
     .action(async () => { await daemonRestart(); });
 
-  // ── External CLIs ─────────────────────────────────────────────────────────
-
-  const externalClis = loadExternalClis();
-
-  const externalCmd = program
-    .command('external')
-    .description('Manage external CLI passthrough commands');
-
-  externalCmd
-    .command('install')
-    .description('Install an external CLI')
-    .argument('<name>', 'Name of the external CLI')
-    .action((name: string) => {
-      const ext = externalClis.find(e => e.name === name);
-      if (!ext) {
-        console.error(`External CLI '${name}' not found in registry.`);
-        process.exitCode = EXIT_CODES.USAGE_ERROR;
-        return;
-      }
-      installExternalCli(ext);
-    });
-
-  externalCmd
-    .command('register')
-    .description('Register an external CLI')
-    .argument('<name>', 'Name of the CLI')
-    .option('--binary <bin>', 'Binary name if different from name')
-    .option('--install <cmd>', 'Auto-install command')
-    .option('--desc <text>', 'Description')
-    .action((name, opts) => {
-      registerExternalCli(name, { binary: opts.binary, install: opts.install, description: opts.desc });
-    });
-
-  externalCmd
-    .command('list')
-    .description('List registered external CLIs')
-    .option('-f, --format <fmt>', 'Output format: table, json, yaml, md, csv', 'table')
-    .action((opts) => {
-      const rows = loadExternalClis().map((ext) => ({
-        name: ext.name,
-        package: ext.package ?? '',
-        binary: ext.binary,
-        installed: isBinaryInstalled(ext.binary),
-        description: ext.description ?? '',
-        homepage: ext.homepage ?? '',
-        tags: ext.tags?.join(', ') ?? '',
-      }));
-      renderOutput(rows, {
-        fmt: opts.format,
-        columns: ['name', 'package', 'binary', 'installed', 'description', 'homepage', 'tags'],
-        title: 'opencli/external/list',
-        source: 'opencli external list',
-      });
-    });
-
-  function passthroughExternal(name: string, parsedArgs?: string[]) {
-    const args = parsedArgs ?? (() => {
-      const idx = process.argv.indexOf(name);
-      return process.argv.slice(idx + 1);
-    })();
-    try {
-      executeExternalCli(name, args, externalClis);
-    } catch (err) {
-      console.error(`Error: ${getErrorMessage(err)}`);
-      process.exitCode = EXIT_CODES.GENERIC_ERROR;
-    }
-  }
-
-  for (const ext of externalClis) {
-    if (program.commands.some(c => c.name() === ext.name)) continue;
-    program
-      .command(ext.name)
-      .description(`(External) ${ext.description || ext.name}`)
-      .argument('[args...]')
-      .allowUnknownOption()
-      .passThroughOptions()
-      .helpOption(false)
-      .action((args: string[]) => passthroughExternal(ext.name, args));
-  }
-
-  // ── Antigravity serve (long-running, special case) ────────────────────────
-
-  const antigravityCmd = program.command('antigravity').description('antigravity commands');
-  antigravityCmd
-    .command('serve')
-    .description('Start Anthropic-compatible API proxy for Antigravity')
-    .option('--port <port>', 'Server port (default: 8082)', '8082')
-    .option('--timeout <seconds>', 'Maximum time to wait for a reply (default: 120s)')
-    .action(async (opts) => {
-      // @ts-expect-error JS adapter — no type declarations
-      const { startServe } = await import('../clis/antigravity/serve.js');
-      await startServe({
-        port: parseInt(opts.port, 10),
-        timeout: opts.timeout ? parsePositiveIntOption(opts.timeout, '--timeout', 120) : undefined,
-      });
-    });
-
   // ── Dynamic adapter commands ──────────────────────────────────────────────
 
-  const siteGroups = new Map<string, Command>();
-  siteGroups.set('antigravity', antigravityCmd);
-  const siteNames = registerAllCommands(program, siteGroups);
+  const siteNames = registerAllCommands(program);
   applyRootSubcommandSummaries(program);
 
-  // ── Help-text grouping: External CLIs / App adapters / Site adapters ──
-  // Classification derives from each adapter's `domain` field — see classifyAdapter.
-  // External CLIs are taken from the externalClis registry (passthrough binaries).
-  const externalNames = externalClis.map(ext => ext.name);
-  const externalHelpEntries = externalClis.map(ext => ({
-    name: ext.name,
-    label: formatExternalCliLabel(ext),
-  }));
-  const siteDomains = new Map<string, string | undefined>();
-  for (const [, cmd] of getRegistry()) {
-    if (!siteDomains.has(cmd.site)) siteDomains.set(cmd.site, cmd.domain);
-  }
-  const apps: string[] = [];
-  const sites: string[] = [];
-  for (const site of siteNames) {
-    if (classifyAdapter(siteDomains.get(site)) === 'app') apps.push(site);
-    else sites.push(site);
-  }
-  const adapterGroups: RootAdapterGroups = { external: externalHelpEntries, apps, sites };
-  const adapterNameSet = new Set<string>([...externalNames, ...siteNames]);
+  const adapterGroups: RootAdapterGroups = { sites: [...siteNames] };
+  const adapterNameSet = new Set<string>(siteNames);
   installCommanderNamespaceStructuredHelp(browser, { globalCommand: program, description: originalBrowserDescription });
+  installCommanderNamespaceStructuredHelp(authCmd, { globalCommand: program, description: 'Inspect website login status' });
   installCommanderNamespaceStructuredHelp(daemonCmd, { globalCommand: program, description: originalDaemonDescription });
   installCommanderNamespaceStructuredHelp(pluginCmd, { globalCommand: program, description: originalPluginDescription });
   installCommanderNamespaceStructuredHelp(adapterCmd, { globalCommand: program, description: originalAdapterDescription });
@@ -3356,15 +3395,9 @@ cli({
   installStructuredHelp(program, () => rootHelpData(program, adapterGroups), () => formatRootAdapterHelpText(adapterGroups));
 
   // ── Unknown command fallback ──────────────────────────────────────────────
-  // Security: do NOT auto-discover and register arbitrary system binaries.
-  // Only explicitly registered external CLIs are allowed.
-
   program.on('command:*', (operands: string[]) => {
     const binary = operands[0];
     console.error(`error: unknown command '${binary}'`);
-    if (isBinaryInstalled(binary)) {
-      console.error(`  Tip: '${binary}' exists on your PATH. Use 'opencli external register ${binary}' to add it as an external CLI.`);
-    }
     program.outputHelp();
     process.exitCode = EXIT_CODES.USAGE_ERROR;
   });

@@ -1,6 +1,7 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { JSDOM } from 'jsdom';
 import { describe, expect, it, vi } from 'vitest';
 import { ArgumentError, CommandExecutionError } from '@jackwener/opencli/errors';
 import { getRegistry } from '@jackwener/opencli/registry';
@@ -31,6 +32,45 @@ describe('twitter reply command', () => {
             },
         ]);
     });
+    it('typed-fails when the reply never leaves the composer', async () => {
+        const cmd = getRegistry().get('twitter/reply');
+        const page = createPageMock([
+            { ok: true },
+            { ok: true },
+            { ok: false, message: 'Reply button is disabled or not found.' },
+        ]);
+
+        await expect(cmd.func(page, {
+            url: 'https://x.com/_kop6/status/2040254679301718161',
+            text: 'never sent',
+        })).rejects.toMatchObject({
+            name: 'CommandExecutionError',
+            code: 'COMMAND_EXEC',
+            exitCode: 1,
+            message: 'Reply button is disabled or not found.',
+            hint: expect.stringContaining('Nothing was posted'),
+        });
+    });
+
+    it('reports an unconfirmed reply as temporary, without claiming nothing was posted', async () => {
+        const cmd = getRegistry().get('twitter/reply');
+        const page = createPageMock([
+            { ok: true },
+            { ok: true },
+            { ok: false, unconfirmed: true, message: 'Reply submission did not complete before timeout.' },
+        ]);
+
+        await expect(cmd.func(page, {
+            url: 'https://x.com/_kop6/status/2040254679301718161',
+            text: 'unconfirmed',
+        })).rejects.toMatchObject({
+            name: 'TimeoutError',
+            code: 'TIMEOUT',
+            exitCode: 75,
+            hint: expect.stringContaining('may already be live'),
+        });
+    });
+
     it('uploads a local image through the dedicated reply composer when --image is provided', async () => {
         const cmd = getRegistry().get('twitter/reply');
         expect(cmd?.func).toBeTypeOf('function');
@@ -157,6 +197,130 @@ describe('twitter reply command', () => {
             url: 'https://x.com/me/status/123',
         }]);
     });
+
+    // Run the click + completion polling scripts against a DOM so current
+    // submit evidence is tested instead of just trusting mocked evaluate rows.
+    const runReplyAgainstDom = async (html, text, { afterClickHtml = '' } = {}) => {
+        const cmd = getRegistry().get('twitter/reply');
+        const dom = new JSDOM(`<!doctype html><body><button data-testid="tweetButton">Reply</button>${html}</body>`, {
+            url: 'https://x.com/compose/post?in_reply_to=2040254679301718161',
+            runScripts: 'outside-only',
+        });
+        dom.window.setTimeout = (callback) => {
+            callback();
+            return 0;
+        };
+        dom.window.HTMLElement.prototype.getClientRects = () => [{ width: 10, height: 10 }];
+        let evaluateCount = 0;
+        const page = createPageMock([], {
+            evaluate: vi.fn((script) => {
+                evaluateCount += 1;
+                if (evaluateCount === 1) return Promise.resolve({ ok: true });
+                if (evaluateCount === 2) {
+                    const result = dom.window.eval(script);
+                    if (afterClickHtml) {
+                        dom.window.document.body.insertAdjacentHTML('beforeend', afterClickHtml);
+                    }
+                    return Promise.resolve(result);
+                }
+                return Promise.resolve(dom.window.eval(script));
+            }),
+        });
+
+        return cmd.func(page, {
+            url: 'https://x.com/_kop6/status/2040254679301718161?s=20',
+            text,
+        });
+    };
+
+    it('does not report reply success from a cleared composer without a fresh toast', async () => {
+        await expect(runReplyAgainstDom('', 'cleared reply')).rejects.toMatchObject({
+            name: 'TimeoutError',
+            code: 'TIMEOUT',
+            exitCode: 75,
+            hint: expect.stringContaining('Reply submission did not complete before timeout.'),
+        });
+    });
+
+    it('ignores a reply success toast that existed before clicking Reply', async () => {
+        const oldToast = `
+            <div role="alert">Your post was sent. <a href="/me/status/3333333333333333333">View</a></div>
+        `;
+
+        await expect(runReplyAgainstDom(oldToast, 'old reply toast')).rejects.toMatchObject({
+            name: 'TimeoutError',
+            code: 'TIMEOUT',
+            exitCode: 75,
+            hint: expect.stringContaining('Reply submission did not complete before timeout.'),
+        });
+    });
+
+    it('returns the permalink from a fresh reply success toast only', async () => {
+        const timeline = '<article><a href="/nasa/status/1111111111111111111">someone else</a></article>';
+        const toast = `
+            <div role="alert">Your post was sent. <a href="/me/status/4444444444444444444">View</a></div>
+        `;
+
+        await expect(runReplyAgainstDom(timeline, 'fresh reply toast', { afterClickHtml: toast })).resolves.toEqual([
+            {
+                status: 'success',
+                message: 'Reply posted successfully.',
+                text: 'fresh reply toast',
+                url: 'https://x.com/me/status/4444444444444444444',
+            },
+        ]);
+    });
+
+    it('does not export a reply permalink from an untrusted toast link host', async () => {
+        const toast = `
+            <div role="alert">Your post was sent. <a href="https://example.com/me/status/5555555555555555555">View</a></div>
+        `;
+
+        await expect(runReplyAgainstDom('', 'reply bad host', { afterClickHtml: toast })).resolves.toEqual([
+            { status: 'success', message: 'Reply posted successfully.', text: 'reply bad host' },
+        ]);
+    });
+
+    it('unwraps Browser Bridge envelopes for reply action results', async () => {
+        const cmd = getRegistry().get('twitter/reply');
+        const page = createPageMock([
+            { session: 'site:twitter', data: { ok: true } },
+            { session: 'site:twitter', data: { ok: true } },
+            {
+                session: 'site:twitter',
+                data: {
+                    ok: true,
+                    message: 'Reply posted successfully.',
+                    url: 'https://x.com/me/status/6666666666666666666',
+                },
+            },
+        ]);
+
+        await expect(cmd.func(page, {
+            url: 'https://x.com/_kop6/status/2040254679301718161?s=20',
+            text: 'wrapped reply',
+        })).resolves.toEqual([{
+            status: 'success',
+            message: 'Reply posted successfully.',
+            text: 'wrapped reply',
+            url: 'https://x.com/me/status/6666666666666666666',
+        }]);
+    });
+
+    it('fails closed when reply completion returns a malformed status URL', async () => {
+        const cmd = getRegistry().get('twitter/reply');
+        const page = createPageMock([
+            { ok: true },
+            { ok: true },
+            { ok: true, message: 'Reply posted successfully.', url: 'https://example.com/me/status/7777777777777777777' },
+        ]);
+
+        await expect(cmd.func(page, {
+            url: 'https://x.com/_kop6/status/2040254679301718161?s=20',
+            text: 'bad reply url',
+        })).rejects.toThrow('malformed status url');
+    });
+
     it('rejects using --image and --image-url together', async () => {
         const cmd = getRegistry().get('twitter/reply');
         expect(cmd?.func).toBeTypeOf('function');
@@ -192,5 +356,45 @@ describe('twitter image helpers (utils.js)', () => {
     it('prefers content-type when resolving remote image extensions', () => {
         expect(utilsTest.resolveImageExtension('https://example.com/no-ext', 'image/webp')).toBe('.webp');
         expect(utilsTest.resolveImageExtension('https://example.com/a.jpeg?x=1', null)).toBe('.jpeg');
+    });
+
+    it('classifies CDP NotAllowed file-input failures as recoverable', () => {
+        expect(utilsTest.isRecoverableFileInputError(new Error('NotAllowedError: Not allowed'))).toBe(true);
+        expect(utilsTest.isRecoverableFileInputError(new Error('ProtocolError: not-allowed'))).toBe(true);
+        expect(utilsTest.isRecoverableFileInputError(new Error('Permission denied'))).toBe(false);
+    });
+
+    it('fails closed when a composer image preview never appears', async () => {
+        const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'opencli-twitter-helper-'));
+        const imagePath = path.join(tempDir, 'missing-preview.png');
+        fs.writeFileSync(imagePath, Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+        const page = createPageMock([{ ok: false, message: 'Image upload timed out (30s).' }], {
+            setFileInput: vi.fn().mockResolvedValue(undefined),
+        });
+
+        await expect(utilsTest.attachComposerImage(page, imagePath)).rejects.toThrow('Image upload timed out');
+        fs.rmSync(tempDir, { recursive: true, force: true });
+    });
+
+    it('does not treat an empty attachments container as uploaded media', async () => {
+        const runMediaReadyProbe = async (html) => {
+            const dom = new JSDOM(`<!doctype html><body>${html}</body>`, {
+                url: 'https://x.com/compose/post',
+                runScripts: 'outside-only',
+            });
+            dom.window.setTimeout = (callback) => {
+                callback();
+                return 0;
+            };
+            const page = {
+                evaluate: vi.fn(async (script) => dom.window.eval(script)),
+            };
+            return utilsTest.waitForComposerMediaReady(page, 1);
+        };
+
+        await expect(runMediaReadyProbe('<div data-testid="attachments"></div>'))
+            .resolves.toMatchObject({ ok: false });
+        await expect(runMediaReadyProbe('<div data-testid="attachments"><img src="blob:https://x.com/1"></div>'))
+            .resolves.toMatchObject({ ok: true, previewCount: 1 });
     });
 });
